@@ -67,12 +67,14 @@ public class SmbjUtils {
     private static volatile SmbjUtils sInstance;
 
     private static SmbConfig smbConfig;
-    // Direct SMB2 negotiation (no SMB1 "multi-protocol" first packet), restricted to SMB 2.1 and 3.0.
-    // Some firmwares (e.g. routers exposing a USB disk) close the connection when they receive the
-    // multi-protocol negotiate packet but answer a plain SMB2 negotiate.
-    private static SmbConfig smbConfigDirectSmb2;
-    // servers (resolved IP + port) that rejected the multi-protocol negotiate: go straight to direct SMB2
-    private static final java.util.Set<String> directSmb2Servers = ConcurrentHashMap.newKeySet();
+    // Connection attempts, in the same order as the Proshektor app, which is known to work with routers that
+    // close the connection on the SMB1 "multi-protocol" negotiate packet that smbj uses by default:
+    //  1) direct SMB2 negotiation, dialects 2.1 and 3.0
+    //  2) direct SMB2 negotiation, all dialects
+    //  3) multi-protocol negotiation (historical behavior)
+    private static java.util.List<SmbConfig> smbConnectConfigs;
+    // which attempt worked for a given server (resolved IP + port): tried first next time
+    private static final java.util.Map<String, Integer> smbConfigIndexByServer = new ConcurrentHashMap<>();
 
     // get the instance, context is used for initial context injection
     public static SmbjUtils getInstance(Context context) {
@@ -104,52 +106,69 @@ public class SmbjUtils {
                 .withMultiProtocolNegotiate(true)
                 .withSigningRequired(false)
                 .build();
-        smbConfigDirectSmb2 = SmbConfig.builder()
+        SmbConfig direct21and30 = SmbConfig.builder()
                 .withSecurityProvider(new BCSecurityProvider())
                 .withMultiProtocolNegotiate(false)
-                .withDialects(SMB2Dialect.SMB_3_0, SMB2Dialect.SMB_2_1)
+                .withDialects(SMB2Dialect.SMB_2_1, SMB2Dialect.SMB_3_0)
                 .withSigningRequired(false)
                 .build();
+        SmbConfig directAllDialects = SmbConfig.builder()
+                .withSecurityProvider(new BCSecurityProvider())
+                .withMultiProtocolNegotiate(false)
+                .withSigningRequired(false)
+                .build();
+        smbConnectConfigs = java.util.Arrays.asList(direct21and30, directAllDialects, smbConfig);
     }
 
     /**
-     * Opens the TCP/SMB connection to the server. The historical multi-protocol negotiation is tried first
-     * (unchanged behavior for servers that work today); if the server rejects it, a direct SMB2 negotiation
-     * (dialects 2.1 and 3.0) is attempted and the server is remembered so that next connections skip the
-     * failing first attempt.
+     * Opens the TCP/SMB connection to the server, trying the configurations of {@link #smbConnectConfigs} in
+     * order (the one that worked last time for this server goes first). A failure to reach the host at all is
+     * not retried with another dialect.
      */
     private Connection connectToServer(String serverIP, int port) throws IOException {
         final String key = serverIP + ":" + (port != -1 ? port : 445);
-        if (!directSmb2Servers.contains(key)) {
+        final int n = smbConnectConfigs.size();
+        final Integer known = smbConfigIndexByServer.get(key);
+        final int[] order = new int[n];
+        int k = 0;
+        if (known != null && known >= 0 && known < n) order[k++] = known;
+        for (int i = 0; i < n; i++) {
+            if (known == null || i != known) order[k++] = i;
+        }
+        Exception last = null;
+        for (int idx : order) {
+            SMBClient client = new SMBClient(smbConnectConfigs.get(idx));
             try {
-                SMBClient client = (smbConfig != null) ? new SMBClient(smbConfig) : new SMBClient();
-                return (port != -1) ? client.connect(serverIP, port) : client.connect(serverIP);
-            } catch (Exception firstFailure) {
-                log.warn("connectToServer: multi-protocol negotiation failed for {} ({}), retrying with direct SMB2",
-                        key, firstFailure.toString());
+                Connection c = (port != -1) ? client.connect(serverIP, port) : client.connect(serverIP);
+                smbConfigIndexByServer.put(key, idx);
+                if (log.isDebugEnabled()) log.debug("connectToServer: {} connected with configuration #{}", key, idx);
+                return c;
+            } catch (Exception e) {
                 try {
-                    Connection c = connectDirectSmb2(serverIP, port);
-                    directSmb2Servers.add(key);
-                    return c;
-                } catch (Exception secondFailure) {
-                    // report the direct SMB2 failure but keep the first one for diagnostics
-                    secondFailure.addSuppressed(firstFailure);
-                    throw asIOException(secondFailure);
+                    client.close();
+                } catch (Exception ignored) {
+                    // nothing to do
                 }
+                log.warn("connectToServer: configuration #{} failed for {}: {}", idx, key, e.toString());
+                if (last != null) e.addSuppressed(last);
+                last = e;
+                if (isHostUnreachable(e)) break; // another dialect will not help
             }
         }
-        try {
-            return connectDirectSmb2(serverIP, port);
-        } catch (Exception e) {
-            // the server may have changed (firmware update): forget it and let the next attempt re-detect
-            directSmb2Servers.remove(key);
-            throw asIOException(e);
-        }
+        smbConfigIndexByServer.remove(key);
+        throw asIOException(last != null ? last : new IOException("Unable to connect to " + key));
     }
 
-    private Connection connectDirectSmb2(String serverIP, int port) throws IOException {
-        SMBClient client = new SMBClient(smbConfigDirectSmb2);
-        return (port != -1) ? client.connect(serverIP, port) : client.connect(serverIP);
+    private static boolean isHostUnreachable(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            if (t instanceof java.net.ConnectException
+                    || t instanceof java.net.NoRouteToHostException
+                    || t instanceof java.net.UnknownHostException) {
+                return true;
+            }
+            if (t.getCause() == t) break;
+        }
+        return false;
     }
 
     private static IOException asIOException(Exception e) {
@@ -453,13 +472,18 @@ public class SmbjUtils {
         return EnumWithValue.EnumUtils.isSet(fileEntry.getFileAttributes(), FileAttributes.FILE_ATTRIBUTE_DIRECTORY);
     }
 
+    // smbj is the SMB client of this build (it can negotiate SMB2 directly, which jcifs-ng cannot do against routers
+    // that cut the multi-protocol negotiation). A dedicated key is used so that neither the old "pref_smbj" value
+    // stored on the device nor Nova's upgrade migration (which forces "pref_smbj" to false) can turn it off.
+    private static final String SMBJ_PREF_KEY = "pref_smbj_smbfix";
+
     public static boolean isSMBjEnabled() {
         if (mContext == null) {
             log.error("isSMBjEnabled: mContext is null! Returning false");
             return false;
         }
-        if (log.isTraceEnabled()) log.trace("isSMBjEnabled={}", PreferenceManager.getDefaultSharedPreferences(mContext).getBoolean("pref_smbj", false));
-        return PreferenceManager.getDefaultSharedPreferences(mContext).getBoolean("pref_smbj", false);
+        if (log.isTraceEnabled()) log.trace("isSMBjEnabled={}", PreferenceManager.getDefaultSharedPreferences(mContext).getBoolean(SMBJ_PREF_KEY, true));
+        return PreferenceManager.getDefaultSharedPreferences(mContext).getBoolean(SMBJ_PREF_KEY, true);
     }
 
     /**
