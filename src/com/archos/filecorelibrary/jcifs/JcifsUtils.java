@@ -166,9 +166,13 @@ public class JcifsUtils {
 
         // reduce network calls for attributes
         prop.put("jcifs.smb.client.attrExpirationPeriod", "30000"); // 30 seconds
+        // fail fast on a LAN when the server does not answer the negotiation (default is 35 s per attempt)
+        prop.put("jcifs.smb.client.connTimeout", "10000");
 
         if (isSmb2) {
-            prop.put("jcifs.smb.client.maxVersion", "SMB311");
+            // Capped at SMB 3.0 (no 3.0.2/3.1.1 negotiate contexts): some router firmwares answer the first
+            // multi-protocol packet but never answer a follow-up SMB2 negotiate that offers 3.1.1.
+            prop.put("jcifs.smb.client.maxVersion", "SMB300");
             prop.put("jcifs.smb.client.snd_buf_size", String.valueOf(SMB2_TRANSPORT_BUFFER_SIZE));
             prop.put("jcifs.smb.client.rcv_buf_size", String.valueOf(SMB2_TRANSPORT_BUFFER_SIZE));
         } else {
@@ -215,6 +219,8 @@ public class JcifsUtils {
 
         // reduce network calls for attributes
         prop.put("jcifs.smb.client.attrExpirationPeriod", "30000"); // 30 seconds
+        // fail fast on a LAN when the server does not answer the negotiation (default is 35 s per attempt)
+        prop.put("jcifs.smb.client.connTimeout", "10000");
 
         if (isSmb2) {
             // This "SMB2 only" context is used for servers that reject the SMB1 multi-protocol negotiate
