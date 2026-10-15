@@ -212,7 +212,9 @@ public class SmbjUtils {
             if (serverIP == null)
                 serverIP = JcifsUtils.getInstance(mContext).getBaseContextOnly(true).getNameServiceClient().getByName(server).getHostAddress();
             if (log.isTraceEnabled()) log.trace("getSmbConnection: {} -> {}", server, serverIP);
+            log.info("getSmbConnection: connecting to {} ({}:{})", server, serverIP, port);
             smbConnection = connectToServer(serverIP, port);
+            log.info("getSmbConnection: connected to {}, negotiated dialect {}", server, smbConnection.getNegotiatedProtocol() != null ? smbConnection.getNegotiatedProtocol().getDialect() : "?");
             smbjConnections.put(cred, smbConnection);
             if (password == null) {
                 password = "";
@@ -246,7 +248,9 @@ public class SmbjUtils {
             }
             Session smbSession;
             try {
+                log.info("getSmbConnection: authenticating on {} as '{}' (domain '{}')", server, username, domain);
                 smbSession = smbConnection.authenticate(ac);
+                log.info("getSmbConnection: authenticated on {}", server);
             } catch (SMBRuntimeException e) {
                 // authentication failed (e.g. SMB2GuestSigningRequiredException, STATUS_ACCESS_DENIED,
                 // STATUS_LOGON_FAILURE): drop the connection so we don't leave a connected-but-
@@ -430,7 +434,9 @@ public class SmbjUtils {
             Session smbSession = smbjSessions.get(cred);
             if (smbSession != null) {
                 try {
+                    log.info("getSmbShare: opening share '{}'", shareName);
                     smbShare = (DiskShare) smbSession.connectShare(shareName);
+                    log.info("getSmbShare: share '{}' opened", shareName);
                     if (log.isTraceEnabled()) log.trace("getSmbShare: saving smbShare {}, smbshare={}", shareName, smbShare);
                     smbjShares.put(cred, smbShare);
                 } catch (SMBRuntimeException e) {

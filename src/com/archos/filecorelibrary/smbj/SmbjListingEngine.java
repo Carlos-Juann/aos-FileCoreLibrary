@@ -97,7 +97,10 @@ public class SmbjListingEngine extends ListingEngine {
                     if (share == null) {
                         throw new IOException("Failed to connect to SMB share: share is null for " + mUri);
                     }
-                    return share.list(filePath);
+                    log.info("SmbjListingThread: listing '{}' on {}", filePath, mUri);
+                    List<FileIdBothDirectoryInformation> listed = share.list(filePath);
+                    log.info("SmbjListingThread: {} entries", listed.size());
+                    return listed;
                 });
 
                 final ArrayList<SmbjFile2> directories = new ArrayList<>();
