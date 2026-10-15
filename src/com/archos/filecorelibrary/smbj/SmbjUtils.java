@@ -29,6 +29,7 @@ import com.hierynomus.msfscc.FileAttributes;
 import com.hierynomus.msfscc.fileinformation.FileIdBothDirectoryInformation;
 
 import com.hierynomus.mserref.NtStatus;
+import com.hierynomus.mssmb2.SMB2Dialect;
 import com.hierynomus.mssmb2.SMBApiException;
 import com.hierynomus.protocol.commons.EnumWithValue;
 import com.hierynomus.protocol.transport.TransportException;
@@ -66,6 +67,12 @@ public class SmbjUtils {
     private static volatile SmbjUtils sInstance;
 
     private static SmbConfig smbConfig;
+    // Direct SMB2 negotiation (no SMB1 "multi-protocol" first packet), restricted to SMB 2.1 and 3.0.
+    // Some firmwares (e.g. routers exposing a USB disk) close the connection when they receive the
+    // multi-protocol negotiate packet but answer a plain SMB2 negotiate.
+    private static SmbConfig smbConfigDirectSmb2;
+    // servers (resolved IP + port) that rejected the multi-protocol negotiate: go straight to direct SMB2
+    private static final java.util.Set<String> directSmb2Servers = ConcurrentHashMap.newKeySet();
 
     // get the instance, context is used for initial context injection
     public static SmbjUtils getInstance(Context context) {
@@ -97,6 +104,56 @@ public class SmbjUtils {
                 .withMultiProtocolNegotiate(true)
                 .withSigningRequired(false)
                 .build();
+        smbConfigDirectSmb2 = SmbConfig.builder()
+                .withSecurityProvider(new BCSecurityProvider())
+                .withMultiProtocolNegotiate(false)
+                .withDialects(SMB2Dialect.SMB_3_0, SMB2Dialect.SMB_2_1)
+                .withSigningRequired(false)
+                .build();
+    }
+
+    /**
+     * Opens the TCP/SMB connection to the server. The historical multi-protocol negotiation is tried first
+     * (unchanged behavior for servers that work today); if the server rejects it, a direct SMB2 negotiation
+     * (dialects 2.1 and 3.0) is attempted and the server is remembered so that next connections skip the
+     * failing first attempt.
+     */
+    private Connection connectToServer(String serverIP, int port) throws IOException {
+        final String key = serverIP + ":" + (port != -1 ? port : 445);
+        if (!directSmb2Servers.contains(key)) {
+            try {
+                SMBClient client = (smbConfig != null) ? new SMBClient(smbConfig) : new SMBClient();
+                return (port != -1) ? client.connect(serverIP, port) : client.connect(serverIP);
+            } catch (Exception firstFailure) {
+                log.warn("connectToServer: multi-protocol negotiation failed for {} ({}), retrying with direct SMB2",
+                        key, firstFailure.toString());
+                try {
+                    Connection c = connectDirectSmb2(serverIP, port);
+                    directSmb2Servers.add(key);
+                    return c;
+                } catch (Exception secondFailure) {
+                    // report the direct SMB2 failure but keep the first one for diagnostics
+                    secondFailure.addSuppressed(firstFailure);
+                    throw asIOException(secondFailure);
+                }
+            }
+        }
+        try {
+            return connectDirectSmb2(serverIP, port);
+        } catch (Exception e) {
+            // the server may have changed (firmware update): forget it and let the next attempt re-detect
+            directSmb2Servers.remove(key);
+            throw asIOException(e);
+        }
+    }
+
+    private Connection connectDirectSmb2(String serverIP, int port) throws IOException {
+        SMBClient client = new SMBClient(smbConfigDirectSmb2);
+        return (port != -1) ? client.connect(serverIP, port) : client.connect(serverIP);
+    }
+
+    private static IOException asIOException(Exception e) {
+        return (e instanceof IOException) ? (IOException) e : new IOException(e);
     }
 
     public int getReadBufferSize() {
@@ -132,14 +189,11 @@ public class SmbjUtils {
                 smbjConnections.remove(cred, smbConnection);
                 smbjSessions.remove(cred);
             }
-            SMBClient smbClient;
-            if (smbConfig != null) smbClient = new SMBClient(smbConfig);
-            else smbClient = new SMBClient();
             String serverIP = SambaDiscovery.getIpFromShareName(server);
             if (serverIP == null)
                 serverIP = JcifsUtils.getInstance(mContext).getBaseContextOnly(true).getNameServiceClient().getByName(server).getHostAddress();
             if (log.isTraceEnabled()) log.trace("getSmbConnection: {} -> {}", server, serverIP);
-            smbConnection = (port != -1) ? smbClient.connect(serverIP, port) : smbClient.connect(serverIP);
+            smbConnection = connectToServer(serverIP, port);
             smbjConnections.put(cred, smbConnection);
             if (password == null) {
                 password = "";

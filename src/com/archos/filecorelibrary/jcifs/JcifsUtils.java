@@ -217,7 +217,10 @@ public class JcifsUtils {
         prop.put("jcifs.smb.client.attrExpirationPeriod", "30000"); // 30 seconds
 
         if (isSmb2) {
-            prop.put("jcifs.smb.client.maxVersion", "SMB311");
+            // This "SMB2 only" context is used for servers that reject the SMB1 multi-protocol negotiate
+            // (e.g. router firmwares exposing a USB disk). Offer only dialects up to SMB 3.0: that is what such
+            // devices are known to answer; SMB 3.0.2/3.1.1 negotiate contexts make some of them drop the connection.
+            prop.put("jcifs.smb.client.maxVersion", "SMB300");
             prop.put("jcifs.smb.client.minVersion", "SMB202");
             // note that connectivity with smbV1 will not be working
             prop.put("jcifs.smb.client.useSMB2Negotiation", "true");
